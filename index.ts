@@ -1,112 +1,235 @@
-import { FunctionCallingConfigMode, GoogleGenAI, type FunctionDeclaration } from "@google/genai";
-import readline from 'node:readline';
+import { FunctionCallingConfigMode, GoogleGenAI, type FunctionDeclaration, type GoogleGenAIInteraction } from "@google/genai";
+import axios from "axios";
 
 const client = new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY,
 });
 
-//TODO::: Adding a bash tool, readfile, writeFile,
-//TODO:: 1.streaming, 2.web_search(fire), 3.create_sub_agent(depth-4)
+//TODO: Adding a bash tool, readfile, writeFile,
+//TODO: 3.create_sub_agent(depth-4)
+
+const webSearch = async (query: string, limit: number) => {
+    try {
+        const apiKey = process.env.FIRECRAWL_API_KEY!;
+
+        if (!apiKey) {
+            throw new Error("Firecrawl api key is missing.");
+        }
+
+        const response = await axios.post("https://api.firecrawl.dev/v2/search",
+            { query, limit },
+            {
+                headers: {
+                    Authorization: `Bearer ${apiKey}`,
+                    "Content-Type": "application/json"
+                },
+            },
+        );
+
+        console.log(response.data);
+        return response.data;
+
+    } catch (error: unknown) {
+        throw new Error("Internal server error.");
+    }
+}
 
 const getWeather = async (city: string) => {
-    const res1 = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`);
+    try {
+        const response1 = await axios.get(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`);
 
-    const data: any = await res1.json();
-    const place = data.result?.[0]
+        const data: any = response1.data;
+        const place = data.results?.[0]
 
-    if (!place) throw new Error("Could not find the weather.");
+        if (!place) throw new Error("Could not find the weather.");
 
-    const res2 = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m`);
+        const response2 = await axios.get(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m`);
 
-    const data2: any = await res2.json();
+        const data2: any = response2.data;
 
-    console.log(`${city}:${data2.temperature_2m}°C`);
-    return `${city}:${data2.temperature_2m}°C`;
+        console.log(`${city}: ${data2.current?.temperature_2m}°C`);
+        return `${city}: ${data2.current?.temperature_2m}°C`;
+    } catch (error: unknown) {
+        throw new Error("Internal server error.");
+    }
 }
 
 const WeatherTool = {
     type: "function",
-    name: 'get_weather',
+    name: "get_weather",
     description: "Gets the current weather for a location.",
     parameters: {
-        type: 'object',
+        type: "object",
         properties: {
             location: {
-                type: 'string',
+                type: "string",
                 description: "The city name, e.g. Mumbai",
             },
         },
-        required: ['location'],
+        required: ["location"],
     },
 } as const;
 
-// const availableFunctions: Record<
-//     "get_weather",
-//     (args: WeatherArgs) => WeatherResult
-// > = {
-//     get_weather: ({ location }: WeatherArgs) => ({
-//         location, temperature: "22", unit: "celsius"
-//     }),
-// };
-// let interaction;
 
-
-let previousId: string | undefined;
+const webSearchTool = {
+    type: "function",
+    name: "web_search",
+    description: "Search the web for current information.",
+    parameters: {
+        type: "object",
+        properties: {
+            query: {
+                type: "string",
+                description: "The web search query.",
+            },
+            limit: {
+                type: "number",
+                minimum: 1,
+                maximum: 10,
+                description: "Maximum number of results to return.",
+            }
+        },
+        required: ["query", "limit"],
+        additionalProperties: true,
+    },
+} as const;
 
 async function main() {
 
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-    });
+    // let interaction;
+    let input: any = "what is microscopic?";
+    let previousId: string | undefined;
 
-    const ip = rl.question("/nYou:");
+    while (true) {
+        const stream1 = await client.interactions.create({
+            model: "gemini-3.1-flash-lite",
+            input,
+            tools: [WeatherTool, webSearchTool],
+            ...(previousId ? { previous_interaction_id: previousId } : {}),
+            // config: {
+            //     tools: [{ functionDeclarations: [getWeather] }],
+            //     automaticFunctionCalling: { disable: true },
+            //     toolConfig: {
+            //         functionCallingConfig: {
+            //             mode: FunctionCallingConfigMode.ANY,
+            //             allowedFunctionNames: ['get_weather'],
+            //         }
+            //     },
+            // }
+            stream: true,
+            generation_config: {
+                tool_choice: "any",
+                thinking_summaries: "auto"
+            },
+        });
 
-    const response = await client.interactions.create({
-        model: "gemini-3.1-flash-lite",
-        input: ip,
-        tools: [WeatherTool],
-        ...(previousId ? { previous_interaction_id: previousId } : {}),
-        // config: {
-        //     tools: [{ functionDeclarations: [getWeather] }],
-        //     automaticFunctionCalling: { disable: true },
-        //     toolConfig: {
-        //         functionCallingConfig: {
-        //             mode: FunctionCallingConfigMode.ANY,
-        //             allowedFunctionNames: ['get_weather'],
-        //         }
-        //     },
-        // }
+        //stream
+        let streamResult = {
+            firstInteractionId: "string",
+            funcCallId: "string",
+            funcCallName: "string",
+            funcArgsAccumulated: "",
+        }
 
-    });
+        for await (const event of stream1) {
+            if (event.event_type === "interaction.created") {
+                streamResult.firstInteractionId = event.interaction.id;
+            } else if (event.event_type === "step.start") {
+                const step = event.step;
+                if (step.type === "function_call") {
+                    streamResult.funcCallId = step.id;
+                    streamResult.funcCallName = step.name;
+                }
+            } else if (event.event_type === "step.delta") {
+                if (event.delta.type === "arguments_delta") {
+                    streamResult.funcArgsAccumulated += event.delta.arguments;
+                }
+            }
+        }
 
-    // const functionResults: FunctionResultInput[] = [];
-    // for (const step of response.steps) {
-    //     if (step.type === "function_call") {
-    //         const result = availableFunctions[
-    //             step.name as keyof typeof availableFunctions
-    //         ](step.arguments as WeatherArgs);
-    //         console.log(`Called ${step.name}(${JSON.stringify(step.arguments)}) →`, result);
-    //         functionResults.push({
-    //             type: "function_result",
-    //             name: step.name,
-    //             call_id: step.id,
-    //             result: [{ type: "text", text: JSON.stringify(result) }],
-    //         });
-    //     }
-    // }
+        // const functionResults: {
+        //     type: "function_result";
+        //     name: string;
+        //     call_id: string;
+        //     result: {
+        //         type: "text";
+        //         text: string;
+        //     }[];
+        // }[] = [];
 
-    // if (functionResults.length === 0) {
-    //     throw new Error("Expecting non-streaming response.");
-    // };
+        const functionResults = [];
+        if (!streamResult.funcCallId && !streamResult.firstInteractionId && !streamResult.funcCallName) {
+            process.stdout.write("\n");
+            break;
+        }
+        const stream2 = await client.interactions.create({
+            model: "gemini-3.1-flash-lite",
+            previous_interaction_id: streamResult.firstInteractionId,
+            input,
+            stream: true,
+        });
 
-    // input = functionResults;
-    previousId = response.id;
+        let result: unknown;
 
-    console.log(response.output_text);
+        const args = JSON.parse(streamResult.funcArgsAccumulated) as Record<string, unknown>;
+
+        // const args1 = JSON.parse(streamResult.funcArgsAccumulated) as {
+        //     location: string,
+        // };
+
+        if (streamResult.funcCallName == "get_weather") {
+            const location = String(args.location || "");
+            if (!location) {
+                throw new Error("Location is missing for weather");
+            }
+
+            result = await getWeather(location);
+        }
+
+        if (streamResult.funcCallName == "web_search") {
+            const query = String(args.query || "");
+            const limit = Number(args.limit || 5);
+
+            if (!query && !limit) {
+                throw new Error("query and limit is missing for web search");
+            }
+
+            result = await webSearch(query, limit);
+        }
+        
+        // const result1 = await getWeather(args1.location);
+
+        // const args2 = JSON.parse(streamResult.funcArgsAccumulated) as {
+        //     query: string,
+        //     limit: number
+        // };
+
+        // const result2 = await webSearch(args2.query, args2.limit);
+
+        // console.log(`Called ${streamResult.funcCallName}(${JSON.stringify(args1)}) →`, result1);
+        console.log(`Called ${streamResult.funcCallName}(${JSON.stringify(args)}) →`, result);
+
+        functionResults.push({
+            type: "function_result",
+            name: streamResult.funcCallName,
+            call_id: streamResult.funcCallId,
+            result: [{ type: "text", text: JSON.stringify(result) }],
+        });
+
+        for await (const event of stream2) {
+            if (event.event_type === "step.delta") {
+                if (event.delta.type === "text") {
+                    // console.log(event.delta.text)
+                    process.stdout.write(event.delta.text);
+                }
+            }
+        }
+        input = functionResults;
+        previousId = streamResult.firstInteractionId;
+    }
+
 }
-
-main();
+main().catch(error => console.log(error));
 
 // this for openrouter
 // if (!('output' in response)) {
